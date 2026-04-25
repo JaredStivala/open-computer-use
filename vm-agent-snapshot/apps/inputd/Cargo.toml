@@ -1,0 +1,16 @@
+[package]
+name = "inputd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-common = { path = "../../crates/agent-common" }
+agent-proto = { path = "../../crates/agent-proto" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

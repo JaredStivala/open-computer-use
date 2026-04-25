@@ -1,0 +1,119 @@
+[[tasks]]
+id = "web-form-fill"
+app = "Firefox"
+category = "web"
+goal = "Open the local benchmark form page, fill name, email, and notes fields, submit it, and verify the success confirmation."
+
+[[tasks]]
+id = "web-search-navigation"
+app = "Firefox"
+category = "web"
+goal = "Search the web for the configured query, open the first result, and verify the page title contains the expected keyword."
+
+[[tasks]]
+id = "web-multitab-copy"
+app = "Firefox"
+category = "web"
+goal = "Open two tabs, copy the headline from the first tab, paste it into the second tab form, and verify the pasted text."
+
+[[tasks]]
+id = "web-login-wall-detection"
+app = "Firefox"
+category = "web"
+goal = "Navigate to the configured protected page and report an auth wall if credentials are required."
+
+[[tasks]]
+id = "files-create-rename"
+app = "Files"
+category = "native-gui"
+goal = "Create a folder in the benchmark directory, rename it, and verify the new folder name is visible."
+
+[[tasks]]
+id = "files-copy-paste"
+app = "Files"
+category = "native-gui"
+goal = "Copy the configured text file to the target folder and verify the copied file appears."
+
+[[tasks]]
+id = "settings-toggle"
+app = "GNOME Settings"
+category = "native-gui"
+goal = "Open Settings, navigate to Accessibility, toggle the configured visual setting, and verify the new state."
+
+[[tasks]]
+id = "window-arrange"
+app = "GNOME Shell"
+category = "native-gui"
+goal = "Open two benchmark windows, arrange them side by side, and verify both remain visible."
+
+[[tasks]]
+id = "text-editor-find-replace"
+app = "gedit"
+category = "text"
+goal = "Open the benchmark document, replace every configured token with the replacement, save, and verify the replacement text."
+
+[[tasks]]
+id = "text-editor-format-transfer"
+app = "gedit"
+category = "text"
+goal = "Copy a paragraph from one document, paste it into another document, save, and verify the destination text."
+
+[[tasks]]
+id = "spreadsheet-entry"
+app = "LibreOffice Calc"
+category = "spreadsheet"
+goal = "Open the benchmark sheet, enter values into the configured cells, add a SUM formula, and verify the result cell."
+
+[[tasks]]
+id = "spreadsheet-sort"
+app = "LibreOffice Calc"
+category = "spreadsheet"
+goal = "Sort the configured table by the amount column descending and verify the first data row has the expected item."
+
+[[tasks]]
+id = "email-draft"
+app = "Thunderbird"
+category = "email"
+goal = "Compose a new draft to the configured recipient with the configured subject and body, then verify it is saved as a draft."
+
+[[tasks]]
+id = "email-search"
+app = "Thunderbird"
+category = "email"
+goal = "Search mail for the configured subject, open the matching message, and verify the sender."
+
+[[tasks]]
+id = "image-viewer-rotate"
+app = "Eye of GNOME"
+category = "image"
+goal = "Open the benchmark image, rotate it clockwise, save a copy, and verify the copy appears in Files."
+
+[[tasks]]
+id = "electron-note"
+app = "Electron benchmark app"
+category = "electron"
+goal = "Create a note in the Electron benchmark app, mark it important, and verify it appears in the important filter."
+
+[[tasks]]
+id = "swing-form"
+app = "Java Swing benchmark app"
+category = "java-swing"
+goal = "Fill the Swing benchmark customer form, submit it, and verify the confirmation dialog."
+
+[[tasks]]
+id = "wine-legacy-dialog"
+app = "Wine legacy benchmark app"
+category = "legacy"
+goal = "Open the legacy dialog, select the configured option, click OK, and verify the result label."
+
+[[tasks]]
+id = "multiapp-file-to-email"
+app = "Files + Thunderbird"
+category = "multi-app"
+goal = "Read the configured filename from Files, compose an email containing that filename, and verify the draft body."
+
+[[tasks]]
+id = "multiapp-web-to-editor"
+app = "Firefox + gedit"
+category = "multi-app"
+goal = "Copy the configured quote from a web page into gedit, save it as a text file, and verify the saved file content is visible."

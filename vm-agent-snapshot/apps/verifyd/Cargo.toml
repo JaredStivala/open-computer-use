@@ -1,0 +1,14 @@
+[package]
+name = "verifyd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-common = { path = "../../crates/agent-common" }
+agent-proto = { path = "../../crates/agent-proto" }
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true

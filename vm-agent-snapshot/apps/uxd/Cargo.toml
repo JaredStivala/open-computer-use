@@ -1,0 +1,12 @@
+[package]
+name = "uxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-common = { path = "../../crates/agent-common" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true

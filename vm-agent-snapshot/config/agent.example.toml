@@ -1,0 +1,24 @@
+[sockets]
+bus = "/tmp/agent/bus.sock"
+capture = "/tmp/agent/capture.sock"
+a11y = "/tmp/agent/a11y.sock"
+input = "/tmp/agent/input.sock"
+action = "/tmp/agent/action.sock"
+verify = "/tmp/agent/verify.sock"
+
+[timeouts_ms]
+verification_default = 800
+model_request = 240000
+
+[reasoning]
+provider = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+model = "google/gemini-3-flash-preview"
+stream = false
+dispatch_early = false
+vision_enabled = true
+min_request_interval_ms = 0
+
+[task]
+step_retry_budget = 5
+task_retry_budget = 50
