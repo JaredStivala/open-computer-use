@@ -35,6 +35,7 @@ DISPLAY="$DISPLAY_ID" xset m 1/1 0 >/dev/null 2>&1 || true
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
   eval "$(dbus-launch --sh-syntax)"
   export DBUS_SESSION_BUS_ADDRESS
+  export DBUS_SESSION_BUS_PID="${DBUS_SESSION_BUS_PID:-}"
 fi
 
 source "$HOME/.cargo/env" 2>/dev/null || true
@@ -78,17 +79,18 @@ ensure_openbox() {
 }
 
 ensure_atspi() {
-  local bus_addr="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
-  export DBUS_SESSION_BUS_ADDRESS="$bus_addr"
+  # The accessibility bus is stateful and stale launchers often keep
+  # Firefox/a11yd from seeing any tree at all. Own a fresh bus per task run.
+  pkill -f '/usr/libexec/at-spi-bus-launcher' >/dev/null 2>&1 || true
   pkill -f '/usr/libexec/at-spi2-registryd' >/dev/null 2>&1 || true
   sleep 0.3
-  if ! pgrep -f '/usr/libexec/at-spi-bus-launcher' >/dev/null 2>&1; then
-    DISPLAY="$DISPLAY_ID" /usr/libexec/at-spi-bus-launcher \
-      >"$LOG_DIR/atspi-launcher.log" 2>&1 &
-    sleep 0.5
-  fi
+  DISPLAY="$DISPLAY_ID" /usr/libexec/at-spi-bus-launcher \
+    >"$LOG_DIR/atspi-launcher.log" 2>&1 &
+  pids+=("$!")
+  sleep 0.5
   DISPLAY="$DISPLAY_ID" /usr/libexec/at-spi2-registryd \
     >"$LOG_DIR/atspi-registryd.log" 2>&1 &
+  pids+=("$!")
   sleep 0.5
 }
 
@@ -117,6 +119,9 @@ ensure_browser() {
 user_pref("accessibility.force_disabled", -1);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
 user_pref("datareporting.policy.dataSubmissionPolicyAcceptedVersion", 2);
 user_pref("app.update.auto", false);
@@ -148,6 +153,7 @@ PREFS
       -profile "$BROWSER_PROFILE" \
       -no-remote \
       -new-instance \
+      --remote-debugging-port "${FIREFOX_REMOTE_DEBUGGING_PORT:-9222}" \
       -width "$WIDTH" \
       -height "$HEIGHT" \
       "$BROWSER_URL" >"$LOG_DIR/firefox.log" 2>&1 &

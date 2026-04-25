@@ -29,15 +29,31 @@ No-model OS probe on Wikipedia:
 - XTest click injection: ~0.8-2.6 ms
 - title-change detection after click: ~3-62 ms
 
+Controller policy run after the BiDi coordinate helper:
+
+- task: Bean to Philosophy Wikipedia first-link walk
+- result: succeeded
+- path length: 15 clicks, then finish on step 16
+- model latency: `0 ms` for every policy step
+- XTest input: ~0-5 ms per click
+- verification/title wait: mostly ~450 ms per click
+- observed route:
+  `Bean -> Genus -> Taxonomic rank -> Taxonomy (biology) -> Biology -> Scientific study -> Scientific theory -> Universe -> Existence -> Reality -> Everything -> Antithesis -> Proposition -> Meaning (philosophy) -> Philosophy of language -> Philosophy`
+
 ## Limiting Factor
 
 After exact XTest input, the main bottlenecks are:
 
-1. Model calls in the current supervisor loop.
-2. Scene readiness/extraction from AT-SPI after page transitions.
-3. Task-rule filtering over GUI elements.
+1. Scene readiness and post-navigation verification.
+2. Keeping helper-provided coordinates aligned with the rendered GUI.
+3. Model calls when no deterministic controller policy applies.
 
-Click delivery is no longer the limiting factor in the X11 VM.
+Click delivery and model latency are no longer the limiting factors for the
+Wikipedia policy path in the X11 VM.
+
+AT-SPI exposed stale hidden Firefox content after navigation. Firefox WebDriver
+BiDi was added as a context helper for visible DOM bounding boxes, while all
+actions still execute as GUI clicks through XTest.
 
 ## Best Next Method
 

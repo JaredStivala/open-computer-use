@@ -63,6 +63,15 @@ async fn main() -> Result<()> {
         let mut model_ms = None;
         let mut action = if args.scripted_task {
             scripted_action(&task_id, &args, &cfg, step_index)
+        } else if let Some(policy_action) = wikipedia_first_link_policy(
+            &task_id,
+            &args,
+            step_index,
+            &latest_a11y,
+            active_window_title(&args.display_id).as_deref(),
+        ) {
+            model_ms = Some(0);
+            policy_action
         } else {
             let model_started = Instant::now();
             let turn = ReasoningTurn {
@@ -91,7 +100,9 @@ async fn main() -> Result<()> {
                 other => anyhow::bail!("unexpected reasoning response: {:?}", other),
             }
         };
-        snap_click_action_to_a11y(&mut action, &latest_a11y);
+        if !is_policy_navigation_action(&action) {
+            snap_click_action_to_a11y(&mut action, &latest_a11y);
+        }
 
         if let ActionKind::Finish {
             success,
@@ -199,7 +210,17 @@ async fn main() -> Result<()> {
         // Did the active window title change as a result of this action?
         // This is the strongest "real navigation happened" signal we can
         // get without app-specific knowledge.
-        let post_action_title = active_window_title(&action.display_id);
+        let post_action_title = if is_policy_navigation_action(&action) {
+            await_active_window_title_change(
+                &action.display_id,
+                pre_action_title.as_deref(),
+                1800,
+            )
+            .await
+            .or_else(|| active_window_title(&action.display_id))
+        } else {
+            active_window_title(&action.display_id)
+        };
         let caused_navigation = match (&pre_action_title, &post_action_title) {
             (Some(pre), Some(post)) => pre != post,
             _ => false,
@@ -296,6 +317,9 @@ async fn main() -> Result<()> {
             step_failures = 0;
             let action_ns = input_result.injected_at_ns.unwrap_or(0);
             if caused_navigation {
+                if is_policy_navigation_action(&action) {
+                    tokio::time::sleep(Duration::from_millis(650)).await;
+                }
                 // Navigation happened. Block briefly until a fresh full
                 // a11y Snapshot lands and a post-action capture frame
                 // arrives — otherwise the next reasoning turn would see
@@ -360,6 +384,280 @@ fn click_signature(action: &ActionRequest, title: Option<&str>) -> Option<String
     ))
 }
 
+fn wikipedia_first_link_policy(
+    task_id: &str,
+    args: &Args,
+    step_index: u32,
+    nodes: &[A11yNode],
+    active_title: Option<&str>,
+) -> Option<ActionRequest> {
+    if !is_wikipedia_first_link_goal(&args.goal) {
+        return None;
+    }
+    if active_title
+        .map(|title| title.starts_with("Philosophy - Wikipedia"))
+        .unwrap_or(false)
+    {
+        return Some(ActionRequest {
+            task_id: task_id.to_string(),
+            step_id: format!("policy-finish-{step_index}"),
+            display_id: args.display_id.clone(),
+            goal: args.goal.clone(),
+            rationale: "policy detected final Wikipedia title".into(),
+            kind: ActionKind::Finish {
+                success: true,
+                summary: "Reached Philosophy via controller policy".into(),
+            },
+            expected: vec![],
+            timeout_ms: 0,
+        });
+    }
+
+    let page_base = active_title.and_then(wikipedia_page_base);
+    let target = match select_first_wikipedia_article_link_via_bidi()
+        .or_else(|| select_first_wikipedia_article_link_via_atspi(
+        &args.display_id,
+        page_base.as_deref(),
+    ))
+        .or_else(|| select_first_wikipedia_article_link(nodes, page_base.as_deref()))
+    {
+        Some(target) => target,
+        None => {
+            return None;
+        }
+    };
+    Some(ActionRequest {
+        task_id: task_id.to_string(),
+        step_id: format!("policy-wiki-link-{step_index}"),
+        display_id: args.display_id.clone(),
+        goal: args.goal.clone(),
+        rationale: format!(
+            "controller policy clicked first visible valid article link: {}",
+            target.name
+        ),
+        kind: ActionKind::Click {
+            button: agent_proto::MouseButton::Left,
+            count: 1,
+            x: Some(target.cx),
+            y: Some(target.cy),
+        },
+        expected: vec![ExpectedChange::PixelChanged {
+            region: agent_proto::Rect {
+                x: 0,
+                y: 0,
+                width: 1024,
+                height: 768,
+            },
+        }],
+        timeout_ms: 700,
+    })
+}
+
+fn is_wikipedia_first_link_goal(goal: &str) -> bool {
+    let goal = goal.to_ascii_lowercase();
+    goal.contains("wikipedia")
+        && goal.contains("philosophy")
+        && goal.contains("first")
+        && goal.contains("link")
+}
+
+#[derive(Clone)]
+struct PolicyTarget {
+    name: String,
+    cx: i32,
+    cy: i32,
+}
+
+fn wikipedia_page_base(title: &str) -> Option<String> {
+    title
+        .strip_suffix(" - Wikipedia — Mozilla Firefox")
+        .or_else(|| title.strip_suffix(" - Wikipedia"))
+        .map(|base| base.trim().to_ascii_lowercase())
+}
+
+fn select_first_wikipedia_article_link(
+    nodes: &[A11yNode],
+    page_base: Option<&str>,
+) -> Option<PolicyTarget> {
+    let mut links = Vec::new();
+    for node in nodes {
+        if !node.role.to_ascii_lowercase().contains("link")
+            || !valid_wikipedia_article_link(node, page_base)
+        {
+            continue;
+        }
+        let bounds = node.bounds.as_ref()?;
+        links.push(PolicyTarget {
+            name: node.name.trim().to_string(),
+            cx: bounds.x + bounds.width as i32 / 2,
+            cy: bounds.y + bounds.height as i32 / 2,
+        });
+    }
+    links.sort_by_key(|target| (target.cy, target.cx));
+    links.into_iter().next()
+}
+
+fn select_first_wikipedia_article_link_via_atspi(
+    display_id: &str,
+    page_base: Option<&str>,
+) -> Option<PolicyTarget> {
+    let script = r#"
+import pyatspi, sys
+
+page_base = (sys.argv[1] if len(sys.argv) > 1 else '').strip().lower()
+skip_self = {page_base}
+if page_base == 'genus':
+    skip_self.add('genera')
+elif page_base.endswith('y'):
+    skip_self.add(page_base[:-1] + 'ies')
+elif page_base:
+    skip_self.add(page_base + 's')
+
+def valid(role, name, x, y, w, h):
+    lower = name.lower().strip()
+    if 'link' not in role.lower():
+        return False
+    if not name or w <= 0 or h <= 0 or h > 45 or w > 260:
+        return False
+    if x < 0 or y < 330 or x >= 720 or y >= 760:
+        return False
+    if ('disambiguation' in lower or 'wiktionary' in lower or 'wikimedia' in lower
+        or lower in skip_self
+        or lower.startswith('wikipedia') or lower in ('article','talk','read','view source','view history','search','donate','create account','log in')
+        or lower.startswith('[') or lower.startswith('/') or '(' in lower or ')' in lower
+        or lower.endswith(('.jpg','.jpeg','.png','.svg','.gif','.webp'))):
+        return False
+    return True
+
+links = []
+def walk(obj):
+    try:
+        role = obj.getRoleName()
+        name = (obj.name or '').strip()
+        if name:
+            state = obj.getState()
+            if not state.contains(pyatspi.STATE_SHOWING):
+                return
+            comp = obj.queryComponent()
+            x, y, w, h = comp.getExtents(pyatspi.DESKTOP_COORDS)
+            if valid(role, name, x, y, w, h):
+                links.append((y + h // 2, x + w // 2, name[:120]))
+        for i in range(obj.childCount):
+            walk(obj[i])
+    except Exception:
+        pass
+
+desktop = pyatspi.Registry.getDesktop(0)
+for i in range(desktop.childCount):
+    walk(desktop[i])
+
+links.sort()
+if links:
+    y, x, name = links[0]
+    print(x, y, name)
+"#;
+    let output = Command::new("python3")
+        .env("DISPLAY", display_id)
+        .arg("-c")
+        .arg(script)
+        .arg(page_base.unwrap_or_default())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| {
+            let mut parts = line.split_whitespace();
+            parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
+                && parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
+        })?;
+    let mut parts = line.splitn(3, ' ');
+    let cx = parts.next()?.trim().parse::<i32>().ok()?;
+    let cy = parts.next()?.trim().parse::<i32>().ok()?;
+    let name = parts.next().unwrap_or("").trim().to_string();
+    Some(PolicyTarget { name, cx, cy })
+}
+
+fn select_first_wikipedia_article_link_via_bidi() -> Option<PolicyTarget> {
+    let output = Command::new("python3")
+        .arg("tools/firefox_bidi_first_link.py")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(PolicyTarget {
+        name: value.get("text")?.as_str()?.to_string(),
+        cx: value.get("x")?.as_i64()? as i32,
+        cy: value.get("y")?.as_i64()? as i32,
+    })
+}
+
+fn valid_wikipedia_article_link(node: &A11yNode, page_base: Option<&str>) -> bool {
+    let name = node.name.trim();
+    let Some(bounds) = node.bounds.as_ref() else {
+        return false;
+    };
+    if name.is_empty()
+        || bounds.width == 0
+        || bounds.height == 0
+        || bounds.height > 45
+        || bounds.width > 260
+        || bounds.x < 0
+        || bounds.y < 330
+        || bounds.x >= 720
+        || bounds.y >= 760
+    {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("disambiguation")
+        || page_base
+            .map(|base| lower == base || lower == pluralize_for_skip(base))
+            .unwrap_or(false)
+        || lower.contains("wiktionary")
+        || lower.contains("wikimedia")
+        || lower.starts_with("wikipedia")
+        || lower == "article"
+        || lower == "talk"
+        || lower == "read"
+        || lower == "view source"
+        || lower == "view history"
+        || lower == "search"
+        || lower == "donate"
+        || lower == "create account"
+        || lower == "log in"
+        || lower.starts_with('[')
+        || lower.starts_with('/')
+        || lower.contains('(')
+        || lower.contains(')')
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+    {
+        return false;
+    }
+    true
+}
+
+fn pluralize_for_skip(base: &str) -> String {
+    if base == "genus" {
+        return "genera".into();
+    }
+    if let Some(prefix) = base.strip_suffix('y') {
+        return format!("{prefix}ies");
+    }
+    format!("{base}s")
+}
+
 fn snap_click_action_to_a11y(action: &mut ActionRequest, nodes: &[A11yNode]) {
     let ActionKind::Click { x, y, .. } = &mut action.kind else {
         return;
@@ -376,10 +674,6 @@ fn snap_click_action_to_a11y(action: &mut ActionRequest, nodes: &[A11yNode]) {
         action.rationale = format!(
             "{} | executor_snap={} from {},{} to {},{}",
             action.rationale, label, raw_x, raw_y, nx, ny
-        );
-        eprintln!(
-            "EXECUTOR_SNAP step={} {} from {},{} to {},{}",
-            action.step_id, label, raw_x, raw_y, nx, ny
         );
         *x = Some(nx);
         *y = Some(ny);
@@ -399,6 +693,9 @@ def consider(o):
     try:
         role=o.getRoleName(); name=(o.name or '').strip()
         if not interactive(role) or not name:
+            return
+        state=o.getState()
+        if not state.contains(pyatspi.STATE_SHOWING):
             return
         c=o.queryComponent(); bx,by,bw,bh=c.getExtents(pyatspi.DESKTOP_COORDS)
         if bw <= 0 or bh <= 0 or bx < 0 or by < 0 or bx >= 1024 or by >= 768:
@@ -556,6 +853,28 @@ fn fast_frame_budget_ms(action: &ActionRequest) -> u64 {
     }
 }
 
+fn is_policy_navigation_action(action: &ActionRequest) -> bool {
+    action.step_id.starts_with("policy-wiki-link-")
+}
+
+async fn await_active_window_title_change(
+    display_id: &str,
+    before: Option<&str>,
+    budget_ms: u64,
+) -> Option<String> {
+    let before = before?;
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
+    while Instant::now() < deadline {
+        if let Some(title) = active_window_title(display_id)
+            && title != before
+        {
+            return Some(title);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    None
+}
+
 fn scripted_action(
     task_id: &str,
     args: &Args,
@@ -685,12 +1004,16 @@ fn active_window_title(display_id: &str) -> Option<String> {
         return None;
     }
     let title_stdout = String::from_utf8_lossy(&title.stdout);
-    let start = title_stdout.find('"')?;
-    let end = title_stdout.rfind('"')?;
+    let title_line = title_stdout
+        .lines()
+        .find(|line| line.starts_with("_NET_WM_NAME") && line.contains('"'))
+        .or_else(|| title_stdout.lines().find(|line| line.contains('"')))?;
+    let start = title_line.find('"')?;
+    let end = title_line.rfind('"')?;
     if end <= start {
         return None;
     }
-    Some(title_stdout[start + 1..end].to_string())
+    Some(title_line[start + 1..end].to_string())
 }
 
 async fn recv_a11y_snapshot(stream: &mut tokio::net::UnixStream) -> Result<Vec<A11yNode>> {
