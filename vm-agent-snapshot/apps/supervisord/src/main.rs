@@ -1,4 +1,4 @@
-use agent_common::{AgentConfig, connect_socket, init_tracing, recv_msg, send_msg};
+use agent_common::{AgentConfig, connect_socket, init_tracing, monotonic_ns, recv_msg, send_msg};
 use agent_proto::{
     A11yEventKind, A11yNode, ActionHistoryEntry, ActionKind, ActionRequest, ActionResult,
     BusMessage, CaptureFrame, ExpectedChange, ReasoningTurn, StepReport, TaskReport, TaskStatus,
@@ -59,19 +59,11 @@ async fn main() -> Result<()> {
         latest_a11y = drain_a11y(&mut a11y, latest_a11y).await?;
         latest_a11y = await_useful_a11y(&mut a11y, latest_a11y, 1000).await?;
         latest_frame = drain_frame(&mut capture, latest_frame).await?;
+        let active_title_for_turn = active_window_title(&args.display_id);
 
         let mut model_ms = None;
         let mut action = if args.scripted_task {
             scripted_action(&task_id, &args, &cfg, step_index)
-        } else if let Some(policy_action) = wikipedia_first_link_policy(
-            &task_id,
-            &args,
-            step_index,
-            &latest_a11y,
-            active_window_title(&args.display_id).as_deref(),
-        ) {
-            model_ms = Some(0);
-            policy_action
         } else {
             let model_started = Instant::now();
             let turn = ReasoningTurn {
@@ -81,7 +73,7 @@ async fn main() -> Result<()> {
                 frame: latest_frame.clone(),
                 a11y_snapshot: latest_a11y.clone(),
                 action_history: history.clone(),
-                active_window_title: active_window_title(&args.display_id),
+                active_window_title: active_title_for_turn,
             };
             let Some(reasoning) = reasoning.as_mut() else {
                 anyhow::bail!("reasoning socket is unavailable");
@@ -100,9 +92,7 @@ async fn main() -> Result<()> {
                 other => anyhow::bail!("unexpected reasoning response: {:?}", other),
             }
         };
-        if !is_policy_navigation_action(&action) {
-            snap_click_action_to_a11y(&mut action, &latest_a11y);
-        }
+        snap_click_action_to_a11y(&mut action, &latest_a11y);
 
         if let ActionKind::Finish {
             success,
@@ -175,15 +165,114 @@ async fn main() -> Result<()> {
         }
         let pre_action_title = active_window_title(&action.display_id);
         let input_started = Instant::now();
-        let input_result = fire_action(&mut input, &action).await?;
+        let accessible_input_result = try_accessible_action(&action);
+        if accessible_input_result.is_none() && click_outside_viewport(&action) {
+            let input_result = ActionResult {
+                task_id: action.task_id.clone(),
+                step_id: action.step_id.clone(),
+                accepted: false,
+                injected_at_ns: None,
+                detail: "blocked off-screen click before injection".into(),
+            };
+            let verification_result = VerificationResult {
+                task_id: action.task_id.clone(),
+                step_id: action.step_id.clone(),
+                status: VerificationStatus::UnexpectedState,
+                detail: "blocked off-screen click before injection".into(),
+                observed_at: chrono::Utc::now(),
+            };
+            history.push(ActionHistoryEntry {
+                action: action.clone(),
+                input_result: Some(input_result),
+                verification_result: Some(verification_result),
+                caused_navigation: false,
+            });
+            steps.push(StepReport {
+                step_id: action.step_id.clone(),
+                action: action.kind.clone(),
+                input_accepted: Some(false),
+                verification_status: Some(VerificationStatus::UnexpectedState),
+                model_ms,
+                input_ms: Some(0),
+                verification_ms: Some(0),
+                duration_ms: step_started.elapsed().as_millis(),
+            });
+            step_failures += 1;
+            task_failures += 1;
+            if step_failures >= cfg.task.step_retry_budget {
+                status = TaskStatus::RetryBudgetExhausted;
+                summary = format!("step retry budget exhausted after {step_failures} failures");
+                break;
+            }
+            continue;
+        }
+        let click_key = click_signature(&action, pre_action_title.as_deref());
+        if accessible_input_result.is_none()
+            && click_key
+                .as_ref()
+                .and_then(|key| ineffective_clicks.get(key))
+                .copied()
+                .unwrap_or(0)
+                >= 2
+        {
+            let input_result = ActionResult {
+                task_id: action.task_id.clone(),
+                step_id: action.step_id.clone(),
+                accepted: false,
+                injected_at_ns: None,
+                detail: "blocked repeated click before injection".into(),
+            };
+            let verification_result = VerificationResult {
+                task_id: action.task_id.clone(),
+                step_id: action.step_id.clone(),
+                status: VerificationStatus::UnexpectedState,
+                detail: format!(
+                    "blocked repeated click with no semantic state transition: {}",
+                    click_key.as_deref().unwrap_or("?")
+                ),
+                observed_at: chrono::Utc::now(),
+            };
+            history.push(ActionHistoryEntry {
+                action: action.clone(),
+                input_result: Some(input_result),
+                verification_result: Some(verification_result),
+                caused_navigation: false,
+            });
+            steps.push(StepReport {
+                step_id: action.step_id.clone(),
+                action: action.kind.clone(),
+                input_accepted: Some(false),
+                verification_status: Some(VerificationStatus::UnexpectedState),
+                model_ms,
+                input_ms: Some(0),
+                verification_ms: Some(0),
+                duration_ms: step_started.elapsed().as_millis(),
+            });
+            step_failures += 1;
+            task_failures += 1;
+            if step_failures >= cfg.task.step_retry_budget {
+                status = TaskStatus::RetryBudgetExhausted;
+                summary = format!("step retry budget exhausted after {step_failures} failures");
+                break;
+            }
+            continue;
+        }
+        let input_result = match accessible_input_result {
+            Some(result) => result,
+            None => fire_action(&mut input, &action).await?,
+        };
         let input_ms = input_started.elapsed().as_millis();
         let verification_started = Instant::now();
         let mut verification_result = if fast_frame_verification {
             let action_ns = input_result.injected_at_ns.unwrap_or(0);
             let budget_ms = fast_frame_budget_ms(&action);
-            let (frame, fresh) =
-                await_fresh_frame_with_status(&mut capture, latest_frame.clone(), action_ns, budget_ms)
-                    .await?;
+            let (frame, fresh) = await_fresh_frame_with_status(
+                &mut capture,
+                latest_frame.clone(),
+                action_ns,
+                budget_ms,
+            )
+            .await?;
             latest_frame = frame;
             if fresh {
                 VerificationResult {
@@ -210,17 +299,7 @@ async fn main() -> Result<()> {
         // Did the active window title change as a result of this action?
         // This is the strongest "real navigation happened" signal we can
         // get without app-specific knowledge.
-        let post_action_title = if is_policy_navigation_action(&action) {
-            await_active_window_title_change(
-                &action.display_id,
-                pre_action_title.as_deref(),
-                1800,
-            )
-            .await
-            .or_else(|| active_window_title(&action.display_id))
-        } else {
-            active_window_title(&action.display_id)
-        };
+        let post_action_title = active_window_title(&action.display_id);
         let caused_navigation = match (&pre_action_title, &post_action_title) {
             (Some(pre), Some(post)) => pre != post,
             _ => false,
@@ -234,45 +313,48 @@ async fn main() -> Result<()> {
             );
         }
 
-        let click_key = click_signature(&action, pre_action_title.as_deref());
-        if matches!(verification_result.status, VerificationStatus::Verified) {
-            if let Some(key) = click_key.as_ref() {
-                if !caused_navigation {
-                    let count = ineffective_clicks.entry(key.clone()).or_insert(0);
-                    *count += 1;
-                    if *count >= 2 {
-                        verification_result.status = VerificationStatus::UnexpectedState;
-                        verification_result.detail = format!(
-                            "blocked repeated click with no semantic state transition: {key}"
-                        );
-                    }
-                } else {
-                    ineffective_clicks.clear();
+        if let Some(key) = click_key.as_ref() {
+            if caused_navigation {
+                ineffective_clicks.clear();
+            } else {
+                let count = ineffective_clicks.entry(key.clone()).or_insert(0);
+                *count += 1;
+                if matches!(verification_result.status, VerificationStatus::Verified) && *count >= 2
+                {
+                    verification_result.status = VerificationStatus::UnexpectedState;
+                    verification_result.detail =
+                        format!("blocked repeated click with no semantic state transition: {key}");
                 }
             }
         }
         let verification_status = verification_result.status.clone();
-
         // Single-line per-step summary so an operator can grep one log to
         // see every input/output of every step at a glance.
         let action_kind_short = match &action.kind {
-            ActionKind::Click { x, y, button, count } => format!(
+            ActionKind::Click {
+                x,
+                y,
+                button,
+                count,
+            } => format!(
                 "Click(btn={:?},n={count},x={},y={})",
                 button,
                 x.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
                 y.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
             ),
-            ActionKind::TypeText { text } => format!(
-                "TypeText({:?})",
-                text.chars().take(60).collect::<String>()
-            ),
+            ActionKind::TypeText { text } => {
+                format!("TypeText({:?})", text.chars().take(60).collect::<String>())
+            }
             ActionKind::KeyCombo { keys } => format!("KeyCombo({})", keys.join("+")),
             ActionKind::MovePointer { x, y, absolute } => {
                 format!("MovePointer(x={x},y={y},abs={absolute})")
             }
             ActionKind::Scroll { dx, dy } => format!("Scroll(dx={dx},dy={dy})"),
             ActionKind::Drag { from, to } => format!("Drag({:?}→{:?})", from, to),
-            ActionKind::Finish { success, summary: s } => format!("Finish(success={success},summary={s:?})"),
+            ActionKind::Finish {
+                success,
+                summary: s,
+            } => format!("Finish(success={success},summary={s:?})"),
             ActionKind::Noop => "Noop".into(),
         };
         let pre_title_str = pre_action_title.as_deref().unwrap_or("?").to_string();
@@ -317,15 +399,11 @@ async fn main() -> Result<()> {
             step_failures = 0;
             let action_ns = input_result.injected_at_ns.unwrap_or(0);
             if caused_navigation {
-                if is_policy_navigation_action(&action) {
-                    tokio::time::sleep(Duration::from_millis(650)).await;
-                }
                 // Navigation happened. Block briefly until a fresh full
                 // a11y Snapshot lands and a post-action capture frame
                 // arrives — otherwise the next reasoning turn would see
                 // stale page data and pick stale link coordinates.
-                latest_a11y =
-                    await_fresh_a11y_snapshot(&mut a11y, latest_a11y, 2500).await?;
+                latest_a11y = await_fresh_a11y_snapshot(&mut a11y, latest_a11y, 2500).await?;
                 latest_frame =
                     await_fresh_frame(&mut capture, latest_frame, action_ns, 1500).await?;
             } else {
@@ -384,278 +462,145 @@ fn click_signature(action: &ActionRequest, title: Option<&str>) -> Option<String
     ))
 }
 
-fn wikipedia_first_link_policy(
-    task_id: &str,
-    args: &Args,
-    step_index: u32,
-    nodes: &[A11yNode],
-    active_title: Option<&str>,
-) -> Option<ActionRequest> {
-    if !is_wikipedia_first_link_goal(&args.goal) {
+fn click_outside_viewport(action: &ActionRequest) -> bool {
+    let ActionKind::Click {
+        x: Some(x),
+        y: Some(y),
+        ..
+    } = action.kind
+    else {
+        return false;
+    };
+    let width = std::env::var("AGENT_SCREEN_WIDTH")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(1024);
+    let height = std::env::var("AGENT_SCREEN_HEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(768);
+    x < 0 || y < 0 || x >= width || y >= height
+}
+
+fn try_accessible_action(action: &ActionRequest) -> Option<ActionResult> {
+    if !matches!(action.kind, ActionKind::Click { .. }) {
         return None;
     }
-    if active_title
-        .map(|title| title.starts_with("Philosophy - Wikipedia"))
-        .unwrap_or(false)
-    {
-        return Some(ActionRequest {
-            task_id: task_id.to_string(),
-            step_id: format!("policy-finish-{step_index}"),
-            display_id: args.display_id.clone(),
-            goal: args.goal.clone(),
-            rationale: "policy detected final Wikipedia title".into(),
-            kind: ActionKind::Finish {
-                success: true,
-                summary: "Reached Philosophy via controller policy".into(),
-            },
-            expected: vec![],
-            timeout_ms: 0,
-        });
+    let target = action.grounding_target.as_deref()?.trim();
+    if target.is_empty() {
+        return None;
     }
-
-    let page_base = active_title.and_then(wikipedia_page_base);
-    let target = match select_first_wikipedia_article_link_via_bidi()
-        .or_else(|| select_first_wikipedia_article_link_via_atspi(
-        &args.display_id,
-        page_base.as_deref(),
-    ))
-        .or_else(|| select_first_wikipedia_article_link(nodes, page_base.as_deref()))
-    {
-        Some(target) => target,
-        None => {
-            return None;
-        }
-    };
-    Some(ActionRequest {
-        task_id: task_id.to_string(),
-        step_id: format!("policy-wiki-link-{step_index}"),
-        display_id: args.display_id.clone(),
-        goal: args.goal.clone(),
-        rationale: format!(
-            "controller policy clicked first visible valid article link: {}",
-            target.name
-        ),
-        kind: ActionKind::Click {
-            button: agent_proto::MouseButton::Left,
-            count: 1,
-            x: Some(target.cx),
-            y: Some(target.cy),
-        },
-        expected: vec![ExpectedChange::PixelChanged {
-            region: agent_proto::Rect {
-                x: 0,
-                y: 0,
-                width: 1024,
-                height: 768,
-            },
-        }],
-        timeout_ms: 700,
-    })
-}
-
-fn is_wikipedia_first_link_goal(goal: &str) -> bool {
-    let goal = goal.to_ascii_lowercase();
-    goal.contains("wikipedia")
-        && goal.contains("philosophy")
-        && goal.contains("first")
-        && goal.contains("link")
-}
-
-#[derive(Clone)]
-struct PolicyTarget {
-    name: String,
-    cx: i32,
-    cy: i32,
-}
-
-fn wikipedia_page_base(title: &str) -> Option<String> {
-    title
-        .strip_suffix(" - Wikipedia — Mozilla Firefox")
-        .or_else(|| title.strip_suffix(" - Wikipedia"))
-        .map(|base| base.trim().to_ascii_lowercase())
-}
-
-fn select_first_wikipedia_article_link(
-    nodes: &[A11yNode],
-    page_base: Option<&str>,
-) -> Option<PolicyTarget> {
-    let mut links = Vec::new();
-    for node in nodes {
-        if !node.role.to_ascii_lowercase().contains("link")
-            || !valid_wikipedia_article_link(node, page_base)
-        {
-            continue;
-        }
-        let bounds = node.bounds.as_ref()?;
-        links.push(PolicyTarget {
-            name: node.name.trim().to_string(),
-            cx: bounds.x + bounds.width as i32 / 2,
-            cy: bounds.y + bounds.height as i32 / 2,
-        });
-    }
-    links.sort_by_key(|target| (target.cy, target.cx));
-    links.into_iter().next()
-}
-
-fn select_first_wikipedia_article_link_via_atspi(
-    display_id: &str,
-    page_base: Option<&str>,
-) -> Option<PolicyTarget> {
     let script = r#"
-import pyatspi, sys
-
-page_base = (sys.argv[1] if len(sys.argv) > 1 else '').strip().lower()
-skip_self = {page_base}
-if page_base == 'genus':
-    skip_self.add('genera')
-elif page_base.endswith('y'):
-    skip_self.add(page_base[:-1] + 'ies')
-elif page_base:
-    skip_self.add(page_base + 's')
-
-def valid(role, name, x, y, w, h):
-    lower = name.lower().strip()
-    if 'link' not in role.lower():
-        return False
-    if not name or w <= 0 or h <= 0 or h > 45 or w > 260:
-        return False
-    if x < 0 or y < 330 or x >= 720 or y >= 760:
-        return False
-    if ('disambiguation' in lower or 'wiktionary' in lower or 'wikimedia' in lower
-        or lower in skip_self
-        or lower.startswith('wikipedia') or lower in ('article','talk','read','view source','view history','search','donate','create account','log in')
-        or lower.startswith('[') or lower.startswith('/') or '(' in lower or ')' in lower
-        or lower.endswith(('.jpg','.jpeg','.png','.svg','.gif','.webp'))):
-        return False
-    return True
-
-links = []
-def walk(obj):
+import re, pyatspi, sys
+target=sys.argv[1]
+def norm(s):
+    return re.sub(r'[^a-z0-9]+', ' ', s.lower()).strip()
+target_n=norm(target)
+best=None
+def interactive(role):
+    r=role.lower()
+    return 'link' in r or 'button' in r or 'entry' in r or r in ('tab','menu item','menu button','check box','radio button','combo box','tree item','password text','spin button')
+def name_score(name):
+    n=norm(name)
+    if not n or not target_n:
+        return None
+    if n == target_n:
+        return 0
+    if target_n in n:
+        return 100 + len(n) - len(target_n)
+    if n in target_n:
+        return 160 + len(target_n) - len(n)
+    words=set(target_n.split())
+    nw=set(n.split())
+    if words and words.issubset(nw):
+        return 220 + len(nw) - len(words)
+    return None
+def consider(o):
+    global best
     try:
-        role = obj.getRoleName()
-        name = (obj.name or '').strip()
-        if name:
-            state = obj.getState()
-            if not state.contains(pyatspi.STATE_SHOWING):
-                return
-            comp = obj.queryComponent()
-            x, y, w, h = comp.getExtents(pyatspi.DESKTOP_COORDS)
-            if valid(role, name, x, y, w, h):
-                links.append((y + h // 2, x + w // 2, name[:120]))
-        for i in range(obj.childCount):
-            walk(obj[i])
+        role=o.getRoleName(); name=(o.name or '').strip()
+        if not interactive(role) or not name:
+            return
+        score=name_score(name)
+        if score is None:
+            return
+        state=o.getState()
+        if not state.contains(pyatspi.STATE_SHOWING):
+            return
+        sensitive = getattr(pyatspi, 'STATE_SENSITIVE', pyatspi.STATE_ENABLED)
+        if not (state.contains(pyatspi.STATE_ENABLED) or state.contains(sensitive)):
+            return
+        c=o.queryComponent(); x,y,w,h=c.getExtents(pyatspi.DESKTOP_COORDS)
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x >= 1024 or y >= 768:
+            return
+        if w * h > (1024 * 768) // 4:
+            return
+        act=o.queryAction()
+        actions=[]
+        for i in range(act.nActions):
+            try:
+                actions.append((i, (act.getName(i) or '').lower()))
+            except Exception:
+                pass
+        if not actions:
+            return
+        action_rank=999
+        action_index=None
+        for rank, names in enumerate((('click','press','activate','jump'), ('open','show','toggle'), ('grab focus','focus'))):
+            for i, name in actions:
+                if any(n in name for n in names):
+                    action_rank=rank
+                    action_index=i
+                    break
+            if action_index is not None:
+                break
+        if action_index is None:
+            action_index=actions[0][0]
+            action_rank=500
+        candidate=(score, action_rank, y, x, o, action_index, name[:100])
+        if best is None or candidate[:4] < best[:4]:
+            best=candidate
     except Exception:
         pass
-
-desktop = pyatspi.Registry.getDesktop(0)
-for i in range(desktop.childCount):
-    walk(desktop[i])
-
-links.sort()
-if links:
-    y, x, name = links[0]
-    print(x, y, name)
+def walk(o):
+    try:
+        consider(o)
+        for i in range(o.childCount):
+            walk(o[i])
+    except Exception:
+        pass
+for app in pyatspi.Registry.getDesktop(0):
+    walk(app)
+if not best:
+    sys.exit(2)
+_, _, _, _, obj, action_index, name = best
+try:
+    ok = obj.queryAction().doAction(action_index)
+    print('OK' if ok else 'FAILED', name)
+    sys.exit(0 if ok else 3)
+except Exception as e:
+    print('FAILED', repr(e))
+    sys.exit(3)
 "#;
     let output = Command::new("python3")
-        .env("DISPLAY", display_id)
+        .env("DISPLAY", &action.display_id)
         .arg("-c")
         .arg(script)
-        .arg(page_base.unwrap_or_default())
+        .arg(target)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .rev()
-        .find(|line| {
-            let mut parts = line.split_whitespace();
-            parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
-                && parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
-        })?;
-    let mut parts = line.splitn(3, ' ');
-    let cx = parts.next()?.trim().parse::<i32>().ok()?;
-    let cy = parts.next()?.trim().parse::<i32>().ok()?;
-    let name = parts.next().unwrap_or("").trim().to_string();
-    Some(PolicyTarget { name, cx, cy })
-}
-
-fn select_first_wikipedia_article_link_via_bidi() -> Option<PolicyTarget> {
-    let output = Command::new("python3")
-        .arg("tools/firefox_bidi_first_link.py")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    Some(PolicyTarget {
-        name: value.get("text")?.as_str()?.to_string(),
-        cx: value.get("x")?.as_i64()? as i32,
-        cy: value.get("y")?.as_i64()? as i32,
+    let detail = stdout.lines().last().unwrap_or("").trim();
+    Some(ActionResult {
+        task_id: action.task_id.clone(),
+        step_id: action.step_id.clone(),
+        accepted: true,
+        injected_at_ns: Some(monotonic_ns()),
+        detail: format!("accepted by AT-SPI action subsystem: {detail}"),
     })
-}
-
-fn valid_wikipedia_article_link(node: &A11yNode, page_base: Option<&str>) -> bool {
-    let name = node.name.trim();
-    let Some(bounds) = node.bounds.as_ref() else {
-        return false;
-    };
-    if name.is_empty()
-        || bounds.width == 0
-        || bounds.height == 0
-        || bounds.height > 45
-        || bounds.width > 260
-        || bounds.x < 0
-        || bounds.y < 330
-        || bounds.x >= 720
-        || bounds.y >= 760
-    {
-        return false;
-    }
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("disambiguation")
-        || page_base
-            .map(|base| lower == base || lower == pluralize_for_skip(base))
-            .unwrap_or(false)
-        || lower.contains("wiktionary")
-        || lower.contains("wikimedia")
-        || lower.starts_with("wikipedia")
-        || lower == "article"
-        || lower == "talk"
-        || lower == "read"
-        || lower == "view source"
-        || lower == "view history"
-        || lower == "search"
-        || lower == "donate"
-        || lower == "create account"
-        || lower == "log in"
-        || lower.starts_with('[')
-        || lower.starts_with('/')
-        || lower.contains('(')
-        || lower.contains(')')
-        || lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".png")
-        || lower.ends_with(".svg")
-        || lower.ends_with(".gif")
-        || lower.ends_with(".webp")
-    {
-        return false;
-    }
-    true
-}
-
-fn pluralize_for_skip(base: &str) -> String {
-    if base == "genus" {
-        return "genera".into();
-    }
-    if let Some(prefix) = base.strip_suffix('y') {
-        return format!("{prefix}ies");
-    }
-    format!("{base}s")
 }
 
 fn snap_click_action_to_a11y(action: &mut ActionRequest, nodes: &[A11yNode]) {
@@ -665,8 +610,12 @@ fn snap_click_action_to_a11y(action: &mut ActionRequest, nodes: &[A11yNode]) {
     let (Some(raw_x), Some(raw_y)) = (*x, *y) else {
         return;
     };
-    let Some((nx, ny, label)) = snap_point_to_a11y(raw_x, raw_y, nodes)
+    let target = action.grounding_target.as_deref();
+    let Some((nx, ny, label)) = target
+        .and_then(|name| snap_target_via_atspi(&action.display_id, name, raw_x, raw_y))
+        .or_else(|| target.and_then(|name| snap_target_to_a11y(name, nodes, raw_x, raw_y)))
         .or_else(|| snap_point_via_atspi(&action.display_id, raw_x, raw_y))
+        .or_else(|| snap_point_to_a11y(raw_x, raw_y, nodes))
     else {
         return;
     };
@@ -678,6 +627,88 @@ fn snap_click_action_to_a11y(action: &mut ActionRequest, nodes: &[A11yNode]) {
         *x = Some(nx);
         *y = Some(ny);
     }
+}
+
+fn snap_target_via_atspi(
+    display_id: &str,
+    target: &str,
+    x: i32,
+    y: i32,
+) -> Option<(i32, i32, String)> {
+    let script = r#"
+import re, pyatspi, sys
+target=sys.argv[1]; x=int(sys.argv[2]); y=int(sys.argv[3])
+def norm(s):
+    return re.sub(r'[^a-z0-9]+', ' ', s.lower()).strip()
+target_n=norm(target)
+best=None
+def interactive(role):
+    r=role.lower()
+    return 'link' in r or 'button' in r or 'entry' in r or r in ('tab','menu item','menu button','check box','radio button','combo box','tree item','password text','spin button')
+def name_score(name):
+    n=norm(name)
+    if not n or not target_n:
+        return None
+    if n == target_n:
+        return 0
+    if target_n in n:
+        return 100 + len(n) - len(target_n)
+    if n in target_n:
+        return 160 + len(target_n) - len(n)
+    words=set(target_n.split())
+    nw=set(n.split())
+    if words and words.issubset(nw):
+        return 220 + len(nw) - len(words)
+    return None
+def consider(o):
+    global best
+    try:
+        role=o.getRoleName(); name=(o.name or '').strip()
+        if not interactive(role) or not name:
+            return
+        score=name_score(name)
+        if score is None:
+            return
+        state=o.getState()
+        if not state.contains(pyatspi.STATE_SHOWING):
+            return
+        c=o.queryComponent(); bx,by,bw,bh=c.getExtents(pyatspi.DESKTOP_COORDS)
+        if bw <= 0 or bh <= 0 or bx < 0 or by < 0 or bx >= 1024 or by >= 768:
+            return
+        if bw * bh > (1024 * 768) // 4:
+            return
+        cx=bx+bw//2; cy=by+bh//2
+        d=abs(cx-x)+abs(cy-y)
+        candidate=(score, d, cx, cy, name[:100])
+        if best is None or candidate < best:
+            best=candidate
+    except Exception:
+        pass
+def walk(o):
+    try:
+        consider(o)
+        for i in range(o.childCount):
+            walk(o[i])
+    except Exception:
+        pass
+for app in pyatspi.Registry.getDesktop(0):
+    walk(app)
+if best:
+    print(best[2], best[3], best[4])
+"#;
+    let output = Command::new("python3")
+        .env("DISPLAY", display_id)
+        .arg("-c")
+        .arg(script)
+        .arg(target)
+        .arg(x.to_string())
+        .arg(y.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_snap_output(&output.stdout, "atspi-target")
 }
 
 fn snap_point_via_atspi(display_id: &str, x: i32, y: i32) -> Option<(i32, i32, String)> {
@@ -738,20 +769,101 @@ if best:
     if !output.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .rev()
-        .find(|line| {
-            let mut parts = line.split_whitespace();
-            parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
-                && parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
-        })?;
+    parse_snap_output(&output.stdout, "atspi-live")
+}
+
+fn parse_snap_output(stdout: &[u8], source: &str) -> Option<(i32, i32, String)> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let line = stdout.lines().rev().find(|line| {
+        let mut parts = line.split_whitespace();
+        parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
+            && parts.next().and_then(|p| p.parse::<i32>().ok()).is_some()
+    })?;
     let mut parts = line.splitn(3, ' ');
     let nx = parts.next()?.trim().parse::<i32>().ok()?;
     let ny = parts.next()?.trim().parse::<i32>().ok()?;
     let name = parts.next().unwrap_or("").trim();
-    Some((nx, ny, format!("atspi-live:{name}")))
+    Some((nx, ny, format!("{source}:{name}")))
+}
+
+fn snap_target_to_a11y(
+    target: &str,
+    nodes: &[A11yNode],
+    raw_x: i32,
+    raw_y: i32,
+) -> Option<(i32, i32, String)> {
+    let target_norm = normalize_target_name(target);
+    if target_norm.is_empty() {
+        return None;
+    }
+    let mut best = None::<(&A11yNode, i32, i32, i32, usize, i32)>;
+    for node in nodes {
+        if !is_interactive_role(&node.role) {
+            continue;
+        }
+        let name = node.name.trim();
+        let name_norm = normalize_target_name(name);
+        let Some(score) = target_name_score(&target_norm, &name_norm) else {
+            continue;
+        };
+        let Some(bounds) = &node.bounds else {
+            continue;
+        };
+        if bounds.width == 0
+            || bounds.height == 0
+            || bounds.x < 0
+            || bounds.y < 0
+            || bounds.x >= 1024
+            || bounds.y >= 768
+            || bounds.width as u64 * bounds.height as u64 > (1024 * 768) / 4
+        {
+            continue;
+        }
+        let cx = bounds.x + bounds.width as i32 / 2;
+        let cy = bounds.y + bounds.height as i32 / 2;
+        let distance = (cx - raw_x).abs() + (cy - raw_y).abs();
+        if best
+            .map(|(_, _, _, _, best_score, best_distance)| {
+                (score, distance) < (best_score, best_distance)
+            })
+            .unwrap_or(true)
+        {
+            best = Some((node, cx, cy, distance, score, distance));
+        }
+    }
+    best.map(|(node, cx, cy, _, _, _)| (cx, cy, format!("target:{}", node.name)))
+}
+
+fn normalize_target_name(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn target_name_score(target: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    if name == target {
+        return Some(0);
+    }
+    if name.contains(target) {
+        return Some(100 + name.len().saturating_sub(target.len()));
+    }
+    if target.contains(name) {
+        return Some(160 + target.len().saturating_sub(name.len()));
+    }
+    let target_words: std::collections::BTreeSet<&str> = target.split_whitespace().collect();
+    let name_words: std::collections::BTreeSet<&str> = name.split_whitespace().collect();
+    if !target_words.is_empty() && target_words.is_subset(&name_words) {
+        return Some(220 + name_words.len().saturating_sub(target_words.len()));
+    }
+    None
 }
 
 fn snap_point_to_a11y(x: i32, y: i32, nodes: &[A11yNode]) -> Option<(i32, i32, String)> {
@@ -853,28 +965,6 @@ fn fast_frame_budget_ms(action: &ActionRequest) -> u64 {
     }
 }
 
-fn is_policy_navigation_action(action: &ActionRequest) -> bool {
-    action.step_id.starts_with("policy-wiki-link-")
-}
-
-async fn await_active_window_title_change(
-    display_id: &str,
-    before: Option<&str>,
-    budget_ms: u64,
-) -> Option<String> {
-    let before = before?;
-    let deadline = Instant::now() + Duration::from_millis(budget_ms);
-    while Instant::now() < deadline {
-        if let Some(title) = active_window_title(display_id)
-            && title != before
-        {
-            return Some(title);
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    None
-}
-
 fn scripted_action(
     task_id: &str,
     args: &Args,
@@ -887,6 +977,7 @@ fn scripted_action(
         display_id: args.display_id.clone(),
         goal: args.goal.clone(),
         rationale: "scripted loop smoke test".into(),
+        grounding_target: None,
         kind: ActionKind::Noop,
         expected: vec![ExpectedChange::AnyUiChange],
         timeout_ms: cfg.timeouts_ms.verification_default,

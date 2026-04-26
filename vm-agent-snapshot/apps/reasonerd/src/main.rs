@@ -111,9 +111,7 @@ async fn infer_action(
             .context("missing CEREBRAS_API_KEY for provider=cerebras")?,
         "openrouter" => std::env::var("OPENROUTER_API_KEY")
             .context("missing OPENROUTER_API_KEY for provider=openrouter")?,
-        other => bail!(
-            "unsupported provider {other}; expected groq, xai, cerebras, or openrouter"
-        ),
+        other => bail!("unsupported provider {other}; expected groq, xai, cerebras, or openrouter"),
     };
     let user_content = build_user_content(&turn, cfg.reasoning.vision_enabled);
     let mut payload = json!({
@@ -173,13 +171,19 @@ async fn infer_action(
                     .and_then(Value::as_str)
                     .map(str::to_string)
             });
+        action.grounding_target = target_name.clone();
         if let ActionKind::Click {
-            ref mut x, ref mut y, ..
+            ref mut x,
+            ref mut y,
+            ..
         } = action.kind
         {
             if let Some((nx, ny, src)) =
                 snap_click_to_visible(&visible, target_name.as_deref(), *x, *y)
             {
+                if action.grounding_target.is_none() {
+                    action.grounding_target = grounding_target_from_snap_source(&src);
+                }
                 if (*x, *y) != (Some(nx), Some(ny)) {
                     tracing::info!(
                         from_x = ?*x,
@@ -239,6 +243,16 @@ async fn infer_action(
     })
 }
 
+fn grounding_target_from_snap_source(source: &str) -> Option<String> {
+    let (_, name) = source.rsplit_once(':')?;
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 async fn send_model_request_with_retries(
     client: &Client,
     url: &str,
@@ -286,6 +300,7 @@ fn failure_action(turn: ReasoningTurn, summary: String) -> ModelActionEnvelope {
             display_id: turn.display_id,
             goal: turn.goal,
             rationale: format!("reasoning failed; no GUI action was taken: {summary}"),
+            grounding_target: None,
             kind: ActionKind::Noop,
             expected: vec![],
             timeout_ms: 500,
@@ -335,8 +350,7 @@ fn build_prompt(turn: &ReasoningTurn) -> String {
         ));
     }
     let total_nodes = turn.a11y_snapshot.len();
-    let mut role_hist: std::collections::BTreeMap<&str, usize> =
-        std::collections::BTreeMap::new();
+    let mut role_hist: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut nodes_with_bounds = 0;
     let mut nodes_with_name = 0;
     for n in &turn.a11y_snapshot {
@@ -409,10 +423,7 @@ fn build_prompt(turn: &ReasoningTurn) -> String {
     for entry in history.iter().skip(skip) {
         let kind = action_kind_short(&entry.action.kind);
         let verified = matches!(
-            entry
-                .verification_result
-                .as_ref()
-                .map(|r| r.status.clone()),
+            entry.verification_result.as_ref().map(|r| r.status.clone()),
             Some(agent_proto::VerificationStatus::Verified)
         );
         s.push_str(&format!(
@@ -572,6 +583,7 @@ fn fallback_action_from_text(turn: &ReasoningTurn, content: &str) -> Option<Acti
         display_id: turn.display_id.clone(),
         goal: turn.goal.clone(),
         rationale: "salvaged from malformed model JSON".into(),
+        grounding_target: None,
         kind: ActionKind::Noop,
         expected: vec![],
         timeout_ms: 2000,
@@ -734,9 +746,7 @@ fn normalize_action_value(turn: &ReasoningTurn, value: Value) -> Value {
     let normalized_kind = normalize_kind_with_fields(kind, &obj, finish_success, &finish_summary);
     obj.insert("kind".into(), normalized_kind);
 
-    let expected = obj
-        .remove("expected")
-        .unwrap_or_else(|| json!([]));
+    let expected = obj.remove("expected").unwrap_or_else(|| json!([]));
     obj.insert("expected".into(), normalize_expected(expected));
 
     Value::Object(obj)
@@ -1060,8 +1070,7 @@ fn snap_click_to_visible(
     if let Some(e) = elements.iter().find(|e| {
         let half_w = (e.width as i32) / 2;
         let half_h = (e.height as i32) / 2;
-        (x >= e.cx - half_w && x <= e.cx + half_w)
-            && (y >= e.cy - half_h && y <= e.cy + half_h)
+        (x >= e.cx - half_w && x <= e.cx + half_w) && (y >= e.cy - half_h && y <= e.cy + half_h)
     }) {
         return Some((e.cx, e.cy, format!("contains:{}", e.name)));
     }

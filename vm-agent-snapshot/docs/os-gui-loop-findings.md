@@ -36,7 +36,9 @@ Controller policy run after the BiDi coordinate helper:
 - path length: 15 clicks, then finish on step 16
 - model latency: `0 ms` for every policy step
 - XTest input: ~0-5 ms per click
-- verification/title wait: mostly ~450 ms per click
+- initial successful run: ~44 s total, mostly due to legacy post-navigation waits
+- optimized hot-path run: ~5.46 s total
+- verification/title wait after optimization: mostly ~80-180 ms per click
 - observed route:
   `Bean -> Genus -> Taxonomic rank -> Taxonomy (biology) -> Biology -> Scientific study -> Scientific theory -> Universe -> Existence -> Reality -> Everything -> Antithesis -> Proposition -> Meaning (philosophy) -> Philosophy of language -> Philosophy`
 
@@ -44,7 +46,7 @@ Controller policy run after the BiDi coordinate helper:
 
 After exact XTest input, the main bottlenecks are:
 
-1. Scene readiness and post-navigation verification.
+1. Browser/page rendering and title-commit latency.
 2. Keeping helper-provided coordinates aligned with the rendered GUI.
 3. Model calls when no deterministic controller policy applies.
 

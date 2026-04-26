@@ -49,8 +49,7 @@ pub async fn run_a11y_loop(
     // (WindowActivate or focus into a new window).
     let snap_display = display_id.clone();
     let snap_tx = tx.clone();
-    let (resnapshot_trigger_tx, resnapshot_trigger_rx) =
-        tokio::sync::mpsc::channel::<()>(8);
+    let (resnapshot_trigger_tx, resnapshot_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
     let initial_size = tree.len();
     tokio::spawn(async move {
         if let Err(err) = run_event_snapshotter(
@@ -68,8 +67,12 @@ pub async fn run_a11y_loop(
 
     let mut events = Box::pin(conn.event_stream());
     while let Some(event_result) = events.next().await {
-        let Ok(event) = event_result else { continue; };
-        let Some(kind) = event_kind(&event) else { continue; };
+        let Ok(event) = event_result else {
+            continue;
+        };
+        let Some(kind) = event_kind(&event) else {
+            continue;
+        };
         let item = event_object_ref(&event);
         let node = match timeout(Duration::from_millis(150), query_node(&conn, &item)).await {
             Ok(Ok(n)) => n,

@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
         rationale:
             "relative motion is deterministic on dummy Xorg after pointer acceleration is disabled"
                 .into(),
+        grounding_target: None,
         kind: ActionKind::MovePointer {
             x: -10_000,
             y: -10_000,
@@ -61,6 +62,7 @@ async fn main() -> Result<()> {
         display_id: args.display_id.clone(),
         goal: "linux real smoke: move pointer to pixel probe".into(),
         rationale: "place pointer over the probe before verifier is armed".into(),
+        grounding_target: None,
         kind: ActionKind::MovePointer {
             x: args.x,
             y: args.y,
@@ -79,6 +81,7 @@ async fn main() -> Result<()> {
         display_id: args.display_id,
         goal: "linux real smoke: click X11 pixel probe and observe XDamage".into(),
         rationale: "the probe flips pixels on click, which must produce a capture event".into(),
+        grounding_target: None,
         kind: ActionKind::Click {
             button: MouseButton::Left,
             count: 1,

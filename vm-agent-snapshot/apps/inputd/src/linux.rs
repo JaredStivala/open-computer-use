@@ -81,6 +81,10 @@ const KEY_SLASH: u16 = 53;
 const KEY_LEFTALT: u16 = 56;
 const KEY_SPACE: u16 = 57;
 const KEY_F1: u16 = 59;
+const KEY_UP: u16 = 103;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
+const KEY_DOWN: u16 = 108;
 const KEY_DELETE: u16 = 111;
 const KEY_LEFTMETA: u16 = 125;
 
@@ -383,13 +387,7 @@ fn normalize_abs(value: i32, extent: i32) -> i32 {
     ((value as i64 * 65_535) / extent.max(1) as i64) as i32
 }
 
-fn xtest_click(
-    display_id: &str,
-    button: &MouseButton,
-    count: u8,
-    x: i32,
-    y: i32,
-) -> Result<()> {
+fn xtest_click(display_id: &str, button: &MouseButton, count: u8, x: i32, y: i32) -> Result<()> {
     let display_name = CString::new(display_id)?;
     let display = unsafe { XOpenDisplay(display_name.as_ptr()) };
     if display.is_null() {
@@ -541,6 +539,10 @@ fn named_key(name: &str) -> Result<u16> {
         "space" => KEY_SPACE,
         "backspace" => KEY_BACKSPACE,
         "delete" | "del" => KEY_DELETE,
+        "left" | "arrowleft" | "leftarrow" => KEY_LEFT,
+        "right" | "arrowright" | "rightarrow" => KEY_RIGHT,
+        "up" | "arrowup" | "uparrow" => KEY_UP,
+        "down" | "arrowdown" | "downarrow" => KEY_DOWN,
         "f1" => KEY_F1,
         single if single.chars().count() == 1 => {
             let ch = single

@@ -1,7 +1,7 @@
 use agent_common::{AgentConfig, bind_socket, connect_socket, init_tracing, send_msg};
-use agent_proto::{A11yEvent, A11yEventKind, BusMessage};
 #[cfg(not(target_os = "linux"))]
-use agent_proto::{A11yNode};
+use agent_proto::A11yNode;
+use agent_proto::{A11yEvent, A11yEventKind, BusMessage};
 use anyhow::Result;
 #[cfg(not(target_os = "linux"))]
 use chrono::Utc;

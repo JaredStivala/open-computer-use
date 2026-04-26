@@ -68,18 +68,35 @@ pub enum MouseButton {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActionKind {
-    MovePointer { x: i32, y: i32, absolute: bool },
+    MovePointer {
+        x: i32,
+        y: i32,
+        absolute: bool,
+    },
     Click {
         button: MouseButton,
         count: u8,
         x: Option<i32>,
         y: Option<i32>,
     },
-    Scroll { dx: i32, dy: i32 },
-    TypeText { text: String },
-    KeyCombo { keys: Vec<String> },
-    Drag { from: (i32, i32), to: (i32, i32) },
-    Finish { success: bool, summary: String },
+    Scroll {
+        dx: i32,
+        dy: i32,
+    },
+    TypeText {
+        text: String,
+    },
+    KeyCombo {
+        keys: Vec<String>,
+    },
+    Drag {
+        from: (i32, i32),
+        to: (i32, i32),
+    },
+    Finish {
+        success: bool,
+        summary: String,
+    },
     Noop,
 }
 
@@ -99,6 +116,8 @@ pub struct ActionRequest {
     pub display_id: String,
     pub goal: String,
     pub rationale: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_target: Option<String>,
     pub kind: ActionKind,
     pub expected: Vec<ExpectedChange>,
     pub timeout_ms: u64,
